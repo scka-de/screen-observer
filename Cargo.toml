@@ -7,3 +7,9 @@ license = "MIT"
 repository = "https://github.com/scka-de/screen-observer"
 
 [dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.35", features = ["sync", "time", "macros", "rt-multi-thread"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+anyhow = "1.0"
