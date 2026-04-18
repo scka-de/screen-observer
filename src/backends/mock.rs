@@ -3,10 +3,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use tokio::sync::broadcast;
 
-use crate::types::{ObservationEvent, EventType, WindowContext};
+use crate::types::{EventType, ObservationEvent, WindowContext};
 use crate::ScreenObserver;
+
+/// Default broadcast channel capacity.
+const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 
 /// A mock screen observer for testing and demo mode.
 ///
@@ -24,7 +28,7 @@ impl MockObserver {
     /// Create a mock that emits the given events at the specified interval.
     #[must_use]
     pub fn with_events(events: Vec<ObservationEvent>, interval: Duration) -> Self {
-        let (sender, _) = broadcast::channel(64);
+        let (sender, _) = broadcast::channel(DEFAULT_CHANNEL_CAPACITY);
         Self {
             events,
             interval,
@@ -50,20 +54,23 @@ impl MockObserver {
                 app_name: app_name.to_string(),
                 window_title: None,
                 browser_url: None,
+                bounding_box: None,
             },
             ocr_text.to_string(),
             0.9,
+            true,
         )
     }
 }
 
+#[async_trait]
 impl ScreenObserver for MockObserver {
     async fn start(&mut self) -> Result<()> {
-        if self.running.load(Ordering::SeqCst) {
+        if self.running.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        self.running.store(true, Ordering::SeqCst);
+        self.running.store(true, Ordering::Release);
 
         let events = self.events.clone();
         let interval = self.interval;
@@ -72,23 +79,25 @@ impl ScreenObserver for MockObserver {
 
         self.task_handle = Some(tokio::spawn(async move {
             for event in events {
-                if !running.load(Ordering::SeqCst) {
+                if !running.load(Ordering::Acquire) {
                     break;
                 }
                 tokio::time::sleep(interval).await;
-                if !running.load(Ordering::SeqCst) {
+                if !running.load(Ordering::Acquire) {
                     break;
                 }
                 // Ignore send errors — no active receivers is fine.
                 let _ = sender.send(event);
             }
+            // Mark as not running when all events are emitted.
+            running.store(false, Ordering::Release);
         }));
 
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<()> {
-        self.running.store(false, Ordering::SeqCst);
+        self.running.store(false, Ordering::Release);
         if let Some(handle) = self.task_handle.take() {
             handle.abort();
         }
@@ -100,7 +109,7 @@ impl ScreenObserver for MockObserver {
     }
 
     fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.running.load(Ordering::Acquire)
     }
 }
 
@@ -125,7 +134,7 @@ mod tests {
             let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
                 .expect("timeout waiting for event")
-                .expect("channel closed");
+                .expect("channel error");
             received.push(event);
         }
 
@@ -149,8 +158,12 @@ mod tests {
         observer.start().await.unwrap();
         assert!(observer.is_running());
 
-        // Receive first event.
-        let _ = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
+        // Wait for and assert first event received.
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for first event")
+            .expect("channel error on first event");
+        assert_eq!(first.window.app_name, "App1");
 
         observer.stop().await.unwrap();
         assert!(!observer.is_running());
@@ -194,7 +207,7 @@ mod tests {
 
         assert_eq!(event1.window.app_name, "Safari");
         assert_eq!(event2.window.app_name, "Safari");
-        assert_eq!(event1.id, event2.id);
+        assert_eq!(event1, event2);
 
         observer.stop().await.unwrap();
     }
@@ -204,6 +217,15 @@ mod tests {
         let mut observer = MockObserver::silent();
         observer.start().await.unwrap();
         observer.start().await.unwrap(); // should not panic or error
+        assert!(observer.is_running());
+        observer.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_safety() {
+        // Verify the trait is object-safe: Box<dyn ScreenObserver> compiles.
+        let mut observer: Box<dyn ScreenObserver> = Box::new(MockObserver::silent());
+        observer.start().await.unwrap();
         assert!(observer.is_running());
         observer.stop().await.unwrap();
     }
