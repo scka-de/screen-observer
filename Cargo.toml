@@ -1,0 +1,9 @@
+[package]
+name = "screen-observer"
+version = "0.1.0"
+edition = "2021"
+description = "A trait-based abstraction for desktop screen observation with pluggable backends"
+license = "MIT"
+repository = "https://github.com/scka-de/screen-observer"
+
+[dependencies]
