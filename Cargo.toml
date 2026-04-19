@@ -20,9 +20,19 @@ anyhow = "1.0"
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { version = "0.24", optional = true }
 core-foundation = { version = "0.10", optional = true }
+xcap = { version = "0.9", optional = true }
+
+[dependencies.image]
+version = "0.25"
+optional = true
+default-features = false
+
+[dependencies.image-compare]
+version = "0.4"
+optional = true
 
 [features]
 default = []
 # Native macOS screen capture backend (macOS only).
 # Enables direct screen capture via CGWindowList + Apple Vision OCR.
-native = ["dep:core-graphics", "dep:core-foundation"]
+native = ["dep:core-graphics", "dep:core-foundation", "dep:xcap", "dep:image", "dep:image-compare"]

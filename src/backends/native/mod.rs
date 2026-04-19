@@ -1,3 +1,5 @@
+pub mod capture;
+pub mod frame_diff;
 pub mod permissions;
 pub mod window_info;
 
