@@ -26,6 +26,13 @@ const CHANNEL_CAPACITY: usize = 256;
 /// Health check timeout.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default OCR confidence assigned to Screenpipe events.
+///
+/// Screenpipe doesn't expose per-frame OCR confidence. This must stay
+/// above `IngestionFilter::MIN_OCR_CONFIDENCE` (0.6) or events will be
+/// silently dropped by the ingestion filter.
+const DEFAULT_OCR_CONFIDENCE: f64 = 0.9;
+
 // --- Screenpipe API response types ---
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +81,34 @@ struct HealthResponse {
     status: String,
 }
 
+// --- Shared health check ---
+
+/// Check if a Screenpipe instance is healthy at the given base URL.
+///
+/// # Errors
+///
+/// Returns an error if the HTTP request fails or the response is unparseable.
+pub async fn check_health(client: &reqwest::Client, base_url: &str) -> Result<bool> {
+    let url = format!("{base_url}/health");
+    let response = client
+        .get(&url)
+        .timeout(HEALTH_TIMEOUT)
+        .send()
+        .await
+        .context("failed to reach Screenpipe")?;
+
+    if !response.status().is_success() {
+        return Ok(false);
+    }
+
+    let health: HealthResponse = response
+        .json()
+        .await
+        .context("failed to parse health response")?;
+
+    Ok(health.status == "healthy")
+}
+
 // --- Observer implementation ---
 
 /// Configuration for the Screenpipe observer.
@@ -105,7 +140,8 @@ pub struct ScreenpipeObserver {
     running: Arc<AtomicBool>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
     /// Last `frame_id` seen, to avoid duplicate events.
-    last_frame_id: Arc<std::sync::Mutex<i64>>,
+    /// Uses `tokio::sync::Mutex` since it's shared with the async polling task.
+    last_frame_id: Arc<tokio::sync::Mutex<i64>>,
 }
 
 impl ScreenpipeObserver {
@@ -128,7 +164,7 @@ impl ScreenpipeObserver {
             sender,
             running: Arc::new(AtomicBool::new(false)),
             task_handle: None,
-            last_frame_id: Arc::new(std::sync::Mutex::new(0)),
+            last_frame_id: Arc::new(tokio::sync::Mutex::new(0)),
         }
     }
 
@@ -144,67 +180,7 @@ impl ScreenpipeObserver {
     ///
     /// Returns an error if the HTTP request fails or the response is unparseable.
     pub async fn health_check(&self) -> Result<bool> {
-        let url = format!("{}/health", self.config.base_url);
-        let response = self
-            .client
-            .get(&url)
-            .timeout(HEALTH_TIMEOUT)
-            .send()
-            .await
-            .context("failed to reach Screenpipe")?;
-
-        if !response.status().is_success() {
-            return Ok(false);
-        }
-
-        let health: HealthResponse = response
-            .json()
-            .await
-            .context("failed to parse health response")?;
-
-        Ok(health.status == "healthy")
-    }
-
-    /// Fetch recent OCR results from Screenpipe.
-    async fn fetch_recent(&self) -> Result<Vec<ObservationEvent>> {
-        let url = format!(
-            "{}/search?content_type=ocr&limit={}&offset=0",
-            self.config.base_url, POLL_LIMIT
-        );
-
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context("failed to fetch from Screenpipe")?;
-
-        let search: SearchResponse = response
-            .json()
-            .await
-            .context("failed to parse search response")?;
-
-        let last_id = *self.last_frame_id.lock().unwrap();
-        let mut events = Vec::new();
-        let mut max_id = last_id;
-
-        for raw in search.data {
-            if let ContentItem::Ocr(ref ocr) = raw.parse() {
-                if ocr.frame_id <= last_id {
-                    continue;
-                }
-                if ocr.frame_id > max_id {
-                    max_id = ocr.frame_id;
-                }
-                events.push(ocr_to_event(ocr));
-            }
-        }
-
-        if max_id > last_id {
-            *self.last_frame_id.lock().unwrap() = max_id;
-        }
-
-        Ok(events)
+        check_health(&self.client, &self.config.base_url).await
     }
 }
 
@@ -231,20 +207,22 @@ impl ScreenObserver for ScreenpipeObserver {
         let running = self.running.clone();
         let last_frame_id = self.last_frame_id.clone();
 
+        // NOTE: polling logic is inline rather than calling a method because
+        // the spawned task needs owned/cloned data — it can't hold &self across
+        // await points. This is a standard Rust async ownership constraint.
         self.task_handle = Some(tokio::spawn(async move {
             while running.load(Ordering::Acquire) {
-                // Fetch recent OCR data.
                 let url = format!("{base_url}/search?content_type=ocr&limit={POLL_LIMIT}&offset=0");
 
                 match client.get(&url).send().await {
                     Ok(response) => {
                         if let Ok(search) = response.json::<SearchResponse>().await {
-                            let last_id = *last_frame_id.lock().unwrap();
-                            let mut max_id = last_id;
+                            let mut last_id = last_frame_id.lock().await;
+                            let mut max_id = *last_id;
 
-                            for raw in search.data {
+                            for raw in &search.data {
                                 if let ContentItem::Ocr(ocr) = raw.parse() {
-                                    if ocr.frame_id <= last_id {
+                                    if ocr.frame_id <= *last_id {
                                         continue;
                                     }
                                     if ocr.frame_id > max_id {
@@ -255,8 +233,8 @@ impl ScreenObserver for ScreenpipeObserver {
                                 }
                             }
 
-                            if max_id > last_id {
-                                *last_frame_id.lock().unwrap() = max_id;
+                            if max_id > *last_id {
+                                *last_id = max_id;
                             }
                         }
                     }
@@ -303,7 +281,7 @@ fn ocr_to_event(ocr: &OcrContent) -> ObservationEvent {
             bounding_box: None,
         },
         ocr_text: ocr.text.chars().take(500).collect(),
-        ocr_confidence: 0.9, // Screenpipe doesn't expose per-frame confidence
+        ocr_confidence: DEFAULT_OCR_CONFIDENCE,
         is_focused: ocr.focused.unwrap_or(true),
     }
 }
@@ -383,10 +361,7 @@ mod tests {
 
         let response: SearchResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.data.len(), 2);
-
-        // First item is OCR.
         assert!(matches!(response.data[0].parse(), ContentItem::Ocr(_)));
-        // Second item is Audio → Other (we don't care about audio in V0).
         assert!(matches!(response.data[1].parse(), ContentItem::Other));
     }
 
@@ -411,6 +386,10 @@ mod tests {
         );
         assert!(event.is_focused);
         assert!(event.ocr_text.contains("Dear Manager"));
+        assert!(
+            (event.ocr_confidence - DEFAULT_OCR_CONFIDENCE).abs() < f64::EPSILON,
+            "confidence should use DEFAULT_OCR_CONFIDENCE"
+        );
     }
 
     #[test]
@@ -431,10 +410,31 @@ mod tests {
     }
 
     #[test]
+    fn ocr_to_event_unfocused() {
+        let ocr = OcrContent {
+            frame_id: 1,
+            text: "text".to_string(),
+            timestamp: Utc::now(),
+            app_name: "App".to_string(),
+            window_name: "Win".to_string(),
+            browser_url: None,
+            focused: Some(false),
+        };
+        assert!(!ocr_to_event(&ocr).is_focused);
+    }
+
+    #[test]
     fn health_response_parses() {
         let json = r#"{"status": "healthy", "status_code": 200}"#;
         let health: HealthResponse = serde_json::from_str(json).unwrap();
         assert_eq!(health.status, "healthy");
+    }
+
+    #[test]
+    fn health_response_unhealthy() {
+        let json = r#"{"status": "degraded", "status_code": 503}"#;
+        let health: HealthResponse = serde_json::from_str(json).unwrap();
+        assert_ne!(health.status, "healthy");
     }
 
     #[test]
@@ -447,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn start_fails_without_screenpipe() {
         let config = ScreenpipeConfig {
-            base_url: "http://localhost:19999".to_string(), // unlikely to be running
+            base_url: "http://localhost:19999".to_string(),
             poll_interval: Duration::from_millis(100),
         };
         let mut observer = ScreenpipeObserver::new(config);
@@ -455,5 +455,12 @@ mod tests {
         let result = observer.start().await;
         assert!(result.is_err());
         assert!(!observer.is_running());
+    }
+
+    #[test]
+    fn default_ocr_confidence_above_ingestion_threshold() {
+        // Ingestion filter MIN_OCR_CONFIDENCE is 0.6.
+        // DEFAULT_OCR_CONFIDENCE must stay above it.
+        assert!(DEFAULT_OCR_CONFIDENCE > 0.6);
     }
 }
