@@ -11,6 +11,39 @@ use tokio::sync::broadcast;
 // Re-export key types at crate root for convenience.
 pub use types::{EventType, ObservationEvent, WindowContext};
 
+// Re-export backends for convenience.
+pub use backends::mock::MockObserver;
+#[cfg(all(target_os = "macos", feature = "native"))]
+pub use backends::native::NativeObserver;
+
+/// Create the best available screen observer for the current platform.
+///
+/// On macOS with the `native` feature enabled, returns a [`NativeObserver`]
+/// that captures the screen directly via `ScreenCaptureKit` + Vision OCR.
+///
+/// Without the `native` feature, returns a [`MockObserver`] with no events
+/// (useful for testing and platforms without native support).
+///
+/// The observer is returned as a trait object — callers don't need to
+/// know which backend is in use.
+#[must_use]
+pub fn create_observer() -> Box<dyn ScreenObserver> {
+    #[cfg(all(target_os = "macos", feature = "native"))]
+    {
+        Box::new(NativeObserver::new(
+            backends::native::NativeConfig::default(),
+        ))
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "native")))]
+    {
+        Box::new(MockObserver::with_events(
+            vec![],
+            std::time::Duration::from_secs(60),
+        ))
+    }
+}
+
 /// Trait that all screen observation backends must implement.
 ///
 /// Backends produce `ObservationEvent`s via a broadcast channel.
